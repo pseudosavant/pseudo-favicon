@@ -3,25 +3,14 @@
 const express = require('express');
 const app = express();
 
-const Url = require('url');
-const https = require('https');
-const http = require('http');
-//const fetch = require('fetch-h2').fetch;
-const fetch = require('node-fetch');
+const h2 = require('fetch-h2')
+const fetch = h2.fetch;
 const x = require('x-ray')();
+const Url = require('url');
 const crypto = require('crypto');
-const fs = require('fs')
+const fs = require('fs');
 
-const tls = require('tls');
-tls.DEFAULT_MIN_VERSION = 'TLSv1';
-
-var rootCas = require('ssl-root-cas/latest').create();
-https.globalAgent.options.ca = rootCas;
-https.globalAgent.options.rejectUnauthorized = false; // Normally dangeous
-
-const listener = app.listen(process.env.PORT, function() {
-  console.info('Your app is listening on port ' + listener.address().port);
-});
+const listener = app.listen(process.env.PORT, () => console.info(`Your app is listening on port ${listener.address().port}`));
 
 const oneYear = 365 * 24 * 60 * 60;
 const thirtyMinutes = 30 * 60;
@@ -34,85 +23,113 @@ const config = {
   caching: false
 }
 
-//app.use(express.static('public'));
-
-app.get('/', async function(req, res) {
+app.get('/best', async function(req, res) {
+  const startTime = Date.now();
   try {
-    const url = decodeURIComponent(req.query.url);
+    const requestUrl = decodeURIComponent(req.query.url);
 
     // TODO: More signficant URL validation
-    if (!url) {
-      res.send('Please supply a URI encoded url as a URL query parameter');
+    if (!requestUrl) {
+      res.send('Please supply a URI component encoded url as a URL query parameter');
       return;
     }
     
-    if (config.caching) {
-      const cachedIcon = await getCachedIcon(url);
-      if (cachedIcon) {
-        console.info(`${url} early cache hit`);
-        await sendIcon(cachedIcon, res);
-        return;
-      } else {
-        console.info(`${url} early cache miss`);
-      }
-    }
+    const icons = await findAllIcons(requestUrl);
+    const validatedIcons = await validateIcons(icons);
+    const bestIcon = pickBestIcon(validatedIcons);
+    res.json(bestIcon);
 
-    console.info(`Checking ${url} for icons`);
-    var icons = await getIcons(url);
-
-    if (!hasEntries(icons.icons)) {
-      const rootHostname = rootDomain(icons.url);
-      console.info(`Checking ${rootHostname} for root icons`);
-      icons = await getIcons(rootHostname);
-    }
-
-    if (!hasEntries(icons.icons)) throw { externalMsg: 'No icon URL found'};
-    const bestIconUrl = pickBestIcon(icons);
-
-    if (bestIconUrl) {
-      const icon = await cachedFetchIcon(bestIconUrl, url);
-      sendIcon(icon, res);
-    } else {
-      throw { externalMsg: 'No icon URL found'};
-    }    
+    const duration = Date.now() - startTime;
+    console.info(`Found ${validatedIcons.length} icons in ${duration}ms`);
   } catch (e) {
-    console.error(e);
-    const msg = (e.externalMsg ? e.externalMsg : 'No icon URL found');
-    res.status(404).send(msg);
+    console.warn(e);
+    console.trace();
+    res.sendStatus(404);
   }
+
+  return;
 });
 
-function sendIcon(icon, res) {
-  res.status(200);
-  res.set('Content-Disposition', 'inline');
-  res.set('Content-Type', icon.type);
-  res.set('Content-Length', icon.length);
-  res.set('Cache-Control',`max-age=${config.cacheDuration}`);
-  res.set('Access-Control-Allow-Origin', '*');
-  res.set('x-icon-from-cache', icon.isCached);
-  res.send(icon.buffer);
-  // TODO: Etag and Last-Modified return 304 (Not Modified);
+app.get('/', async function(req, res) {
+  const startTime = Date.now();
+  try {
+    const requestUrl = decodeURIComponent(req.query.url);
+
+    // TODO: More signficant URL validation
+    if (!requestUrl) {
+      res.send('Please supply a URI component encoded url as a URL query parameter');
+      return;
+    }
+    
+    const icons = await findAllIcons(requestUrl);
+    const validatedIcons = await validateIcons(icons);
+    res.json(validatedIcons);
+
+    const duration = Date.now() - startTime;
+    console.info(`Found ${validatedIcons.length} icons in ${duration}ms`);
+  } catch (e) {
+    console.warn(e);
+    console.trace();
+    res.sendStatus(404);
+  }
+
+  return;
+});
+
+function pickBestIcon(icons) {
+  const order = [
+    'shortcutIcon',
+    'rootIcon',
+    'appleTouchIcon',
+    'appleTouchIconPrecomposed',
+    'opengraph',
+    'twitter',
+    'msapplicationTileImage',
+    'rootIcon',
+    'secondLevelRootIcon',
+    'iconImage'
+  ];
+
+  const o = icons.reduce(function(acc, icon){
+    const iconType = icon.iconType;
+    acc[iconType] = icon;
+    
+    return acc;
+  }, {});
+  
+  try {
+    order.forEach(function(key){
+      const icon = o[key];
+      if (icon) throw icon;
+    });
+    
+    throw { undefined };
+  } catch (icon) {
+    if (icon) return icon;
+  }
+
+  return undefined;
 }
 
-async function getIcons(url) {
-  if (typeof url !== 'string' || url.length === 0) return null;
-  
-  const page = await getPageContents(url);
+async function findAllIcons(requestUrl) {
+  const page = await get(requestUrl);
 
-  const pageIcons = (page.ok ? await getPageIcons(page.html, page.url) : null);
-  const rootIcon = await rootFaviconCheck(page.url);
-
-  const icons = {
-    ...pageIcons,
-    ...(rootIcon ? { rootIcon: rootIcon } : null)
-  };
-  if (isEmptyObject(icons)) return { icons: null, url: page.url};
+  const requests = [
+    findRootIconUrls(requestUrl),
+    findPageIconUrls(requestUrl)
+  ];
   
-  const resolved = { icons: resolveUrls(icons, page.url), url: page.url };
-  return resolved;
+  if (page && page.url !== requestUrl) {
+    requests.push(findRootIconUrls(page.url));
+  }
+  
+  const icons = (await Promise.all(requests)).flat();
+  // find icons in page
+  // Validate all icons exist
+  return icons;
 }
 
-async function getPageIcons(html, baseUrl) {
+async function findPageIconUrls(html) {
   // TODO: Make all rel and name attributes lower case
   html = html.replace(/shortcut icon/gi, 'shortcut icon'); // Handle all caps
 
@@ -126,240 +143,176 @@ async function getPageIcons(html, baseUrl) {
     opengraph: 'meta[property="og:image"]@content',
     iconImage: 'img[src*="Icon"]@src'
   };
-  const iconsArr = await x(html, 'html', [selectors]);
-  const icons = (iconsArr && iconsArr[0] ? iconsArr[0] : null);
-
-  // Do aggressive search of whole DOM looking for images that have 'logo' or 'icon' in the
+  const res = await x(html, 'html', [selectors]);
+  var icons = [];
+  
+  if (res && res[0]) {
+    const entries = Object.entries(res[0]);
+    
+    entries.forEach(function(entry) {
+      const url = entry[1];
+      const iconType = entry[0];
+      icons.push({ url, iconType });
+    });
+  }
+  
+  // TODO Do aggressive search of whole DOM looking for images that have 'logo' or 'icon' in the
   // filename. Also try to prioritize square icons
   
-  // calculate image dimensions  
+  // TODO calculate image dimensions  
+  
   if (icons && Object.keys(icons).length === 0) return null;
+  return icons;  
+}
+
+async function findRootIconUrls(requestUrl) {
+  const icons = [];
+  const rootIcon = { url: rootIconUrl(requestUrl), iconType: 'rootIcon' };
+  icons.push(rootIcon);
+  
+  const secondLevel = secondLevelDomainUrl(requestUrl);
+  if (secondLevel) {
+    const secondLevelIcon = rootIconUrl(secondLevel);
+    if (secondLevelIcon && secondLevelIcon !== rootIcon) {
+      icons.push({ url: secondLevelIcon, iconType: 'secondLevelRootIcon'});
+    }
+  }
+  
   return icons;
 }
 
-async function redirectCheck(url) {
-  const page = await getPageContents(url);
+function rootIconUrl(requestUrl) {
+  if (typeof requestUrl !== 'string') return undefined;
+  const parsedUrl = Url.parse(requestUrl);
+  
+  const url = `${parsedUrl.protocol}//${parsedUrl.hostname}/favicon.ico`;
+  return url;
+}
 
-  const frame = (page.ok ? await x(page.html, 'html', { src: 'frame@src'}) : null);
-  const resolved = resolveUrl(frame.src, page.url);
-  return resolved;
+async function validateIcons(icons) {
+  const promises = icons.map(validateIcon);
+
+  const res = (await Promise.all(promises)).flat();
+  const filtered = res.filter((icon) => icon.valid);
+  const cleaned = res.map(function(icon) {
+    delete icon.valid;
+    return icon;
+  });
+  return cleaned;
+}
+
+async function validateIcon(icon) {
+  const check = await checkUrl(icon.url);
+  const isValid = (check && check.ok && isImageMimeType(check));
+  const res = {
+    valid: isValid,
+    mimeType: check.mimeType,
+    base64: check.base64,
+    ...icon
+  };
+
+  return res;
 }
 
 function isImageMimeType(res) {
-  const type = (res && res.headers ? res.headers.get('Content-Type') : res);
-  
   const imageRe = /image\//i;
+
+  var type = '';
+  
+  if (typeof res === 'string') type = (res);
+  if (typeof res.mimeType === 'string') type = res.mimeType;
+  if (res && res.headers && res.headers.has('Content-Type')) type = res.headers.get('Content-Type');
+  
   return imageRe.test(type);
 }
 
-async function rootFaviconCheck(url) {
-  const opts = {
-    method: 'HEAD'
+async function fetchResToResObj(res) {
+  return {
+    ok: res.ok || false,
+    status: res.status || 404,
+    redirected: res.redirected || false,
+    url: res.url,
+    headers: res.headers,
+    mimeType: res.headers.get('content-type') || undefined,
+    length: res.headers.get('content-length') || undefined,
+    base64: (res && res.ok && typeof res.arrayBuffer === 'function' ? arrayBufferToBase64(await res.arrayBuffer()) : undefined)
   };
-  
-  const parsedUrl = Url.parse(url);
-  
-  const rootUrl = `${parsedUrl.protocol}//${parsedUrl.hostname}/favicon.ico`;
-  const res = await get(rootUrl, opts);
-
-  // TODO: add check for if it is actuall an icon/png/jpg file
-  if (res && res.ok && isImageMimeType(res)) {
-    return rootUrl;
-  }
-  
-  return null;
 }
 
-function rootDomain(url) {
-  const parsedUrl = Url.parse(url);
-  const hostname = parsedUrl.hostname;
-  const protocol = parsedUrl.protocol;
+function headersToObj(headers) {
+  const entries = [...headers.entries()];
+  const obj = entries.reduce(function(acc, cv) {
+    const key = cv[0].toLowerCase();
+    const value = cv[1];
+    
+    acc[key] = value;
+    
+    return acc;
+  }, {});
+  
+  return obj;
+}
+
+async function checkUrl(requestUrl, cached=false, getMethod) {
+  //const opts = { method: (getMethod ? 'GET' : 'HEAD') };
+  const opts = { method: 'GET' }; // Can't use HEAD requests due to bug here: https://github.com/grantila/fetch-h2/issues/70
+  
+  const failedResponse = {
+    ok: false,
+    status: 404,
+    url: requestUrl,
+    redirected: false,
+    headers: undefined,
+    base64: undefined
+  }
+ 
+  try {
+    console.info(`Checking ${requestUrl} availability`);
+    const res = await get(requestUrl, opts);
+    console.info(`${requestUrl} is ${(res && res.ok ? '' : 'not ')}available`);
+
+    return res;
+  } catch (e) {
+    console.warn(e);
+    console.trace();
+    return { ...failedResponse, ...{ error: e} };
+  }
+  
+  return false;  
+}
+
+async function get(requestUrl, fetchOpts) {    
+  const baseOpts = { redirect: 'follow' };
+  const opts = { ...baseOpts, ...fetchOpts };
+      
+  try {
+    console.info(`Fetching ${requestUrl}`);
+    
+    if (isDataUri(requestUrl)) {
+      return dataUriToResponse(requestUrl);
+    } else {
+      return fetchResToResObj(await fetch(requestUrl, opts));
+    };
+  } catch (e) {
+    console.warn(`Unable to fetch ${requestUrl}`);
+    console.warn(e);
+    return null;
+  }
+}
+
+function secondLevelDomainUrl(url) {
+  const parsed = Url.parse(url);
+  const hostname = parsed.hostname;
+  const protocol = parsed.protocol;
 
   const domainRe = /\.([^.\s]+?\.[^.\s]+?)$/i;
   const result = domainRe.exec(hostname);
-  const rootHostname = (result && result[1] ? result[1] : null);
-  const rootDomain = (rootHostname ? `${protocol}//${rootHostname}` : null);
 
-  return rootDomain;
-}
-
-function resolveUrls(urls, base) {
-  Object.keys(urls).forEach(function(key){
-    const url = urls[key];
-    urls[key] = resolveUrl(base, url);
-  });
-  return urls;
-}
-
-function resolveUrl(base, url) {
-  if (!url || !base) return url;
-  return Url.resolve(base, url);
-}
-
-function pickBestIcon(iconsRes) {
-  const icons = iconsRes.icons;
-  const order = [
-    'shortcutIcon',
-    'rootIcon',
-    'appleTouchIcon',
-    'appleTouchIconPrecomposed',
-    'opengraph',
-    'twitter',
-    'msapplicationTileImage',
-    'rootDomainIcon',
-    'iconImage'
-  ];
-
-  try {
-    order.forEach(function(key){
-      if (icons[key]) throw {icon: icons[key]};
-    });
-    
-    throw { icon: false };
-  } catch (e) {
-    if (e.icon) return e.icon;
+  if (result && result[1]) {
+    return `${protocol}//${result[1]}`;
   }
 
-  throw { externalMsg: `Unabled to select 'best' icon`, res: iconsRes};
-}
-
-async function fetchIcon(url) {
-  const res = await get(url);
-  
-  if (res.ok && isImageMimeType(res)) {
-    return {
-      headers: [...res.headers.entries()],
-      type: res.headers.get('Content-Type'),
-      length: res.headers.get('Content-Length'),
-      buffer: await res.buffer(),
-      sourceUrl: url
-    };
-  }
-  
-  throw { externalMsg: `Unable to retrieve icon at ${url}`};
-}
-
-async function getCachedIcon(requestUrl) {
-  const promise = new Promise(async function(resolve, reject){
-    const hash = md5(requestUrl);
-    
-    const isCached = await iconExists(hash);
-    var icon;
-    if (config.caching && isCached) {
-      icon = await readIcon(hash);
-      icon.isCached = true;
-    }
-    
-    if (icon) {
-      resolve(icon);
-    } else {
-      resolve(null);
-    }
-  });
-  
-  return promise;
-}
-
-async function cachedFetchIcon(url, requestUrl) {
-  const promise = new Promise(async function(resolve, reject){
-    const hash = md5(requestUrl);
-    
-    const isCached = await iconExists(hash);
-    var icon;
-
-    if (config.caching && isCached) {
-      console.info(`${url} cache hit`);
-      icon = await readIcon(hash);
-      icon.isCached = true;
-    } else {
-      console.info(`${url} cache miss`);
-
-      if (isDataUri(url)) {
-        icon = dataUriToIcon(url);
-      } else {
-        icon = await fetchIcon(url);
-      }
-
-      icon.isCached = false;
-      writeIcon(hash, icon);
-    }
-    
-    if (icon) resolve(icon);
-  });
-  
-  return promise;
-}
-
-function readIcon(hash) {
-  const promise = new Promise(function(resolve, reject){
-    fs.readFile(getIconPath(hash), function(err, file){
-      if (err) {
-        console.error(err);
-        throw { externalMsg: 'Unable to read file from cache'};
-      }
-      
-      const icon = JSON.parse(file);
-      icon.buffer = Buffer.from(icon.base64, 'base64');
-      delete icon.base64;      
-
-      console.info(`Read icon ${getIconPath(hash)} for ${icon.sourceUrl}`);
-      
-      resolve(icon);
-    });
-  });
-  
-  return promise;
-}
-
-function dataUriToIcon(uri) {
-  const dataUriRe = /data:(image\/(?:png|jpeg));base64,(.*)==/i;
-  const extracted = dataUriRe.exec(uri);
-  const type = extracted[1];
-  const base64 = extracted[2];
-  const decoded = Buffer.from(base64, 'base64').toString('utf-8');  
-
-  const icon = {
-    headers: [],
-    type: type,
-    length: decoded.length,
-    buffer: Buffer.from(base64, 'base64'),
-    sourceUrl: 'dataUri'
-  };
-
-  return icon;
-}
-
-function iconBase64ToBuffer(icon) {
-  try {
-    icon.buffer = Buffer.from(icon.base64, 'base64');
-    delete icon.base64;      
-    return icon
-  } catch (e) {
-    console.error(e);
-    throw { externalMsg: 'Unable to convert base64 to buffer' }
-  }
-}
-
-function writeIcon(hash, icon) {
-  const data = {
-    headers: icon.headers,
-    type: icon.type,
-    length: icon.length,
-    base64: icon.buffer.toString('base64'),
-    sourceUrl: icon.sourceUrl
-  };
-  
-  const json = JSON.stringify(data);
-  
-  const promise = new Promise(function(resolve, reject) {
-    fs.writeFile(getIconPath(hash), json, 'utf8', (err) => {
-      if (err) {
-        console.error(err);
-      } else {
-        console.info(`Wrote icon ${getIconPath(hash)} for ${icon.sourceUrl}`);
-      }
-    });
-  });
+  return undefined;
 }
 
 function getIconPath(hash) {
@@ -367,8 +320,7 @@ function getIconPath(hash) {
 }
 
 async function iconExists(hash) {
-  const exists = await fileExists(getIconPath(hash));
-  return exists;
+  return await fileExists(getIconPath(hash));
 }
 
 function fileExists(path) {
@@ -389,46 +341,6 @@ function fileExists(path) {
   return promise;
 }
 
-async function get(url, fetchOpts) {
-  const httpsRe = /^https:\/\//i;
-  const isHttps = httpsRe.test(url);
-    
-  const opts = fetchOpts || { redirect: 'follow' };
-  
-  try {
-    const res = await fetch(url, opts);
-    
-    return res;
-  } catch (e) {
-    console.error(`Unable to fetch ${url}`);
-    console.error(e);
-    return null;
-  }
-}
-
-async function getPageContents(url, opts) {
-  try {    
-    const res = await get(url, opts);
-
-    if (!res.ok) return res;
-
-    if (isValidHTMLResponse(res)) {
-      const html = await res.text();
-      return { ok: true, url: res.url, html: html};
-    } else {
-      throw { res, externalMsge: `${url} does not contain HTML` };
-    }
-  } catch(e) {
-    console.error(e);
-    return e.res;
-  }  
-}
-
-function isValidHTMLResponse(res) {
-  const isHtml = res && res.headers.get('Content-Type').match(/^text\/html/i);
-  return isHtml;
-}
-
 function md5(s) {
   return (s ? crypto.createHash('md5').update(s).digest('hex') : null);
 }
@@ -438,10 +350,23 @@ function isDataUri(uri) {
   return dataUriRe.test(uri);
 }
 
-function isEmptyObject(o) {
-  return Object.keys(o).length === 0;
+function dataUriToResponse(uri) {
+  const dataUriRe = /data:(image\/(?:png|jpeg));base64,(.*)==/i;
+  const extracted = dataUriRe.exec(uri);
+  const type = extracted[1];
+  const base64 = extracted[2]; 
+  
+  return {
+    ok: true,
+    status: 200,
+    redirected: false,
+    url: uri,
+    headers: undefined,
+    mimeType: type,
+    length: base64.length,
+    base64: base64
+  }
+
 }
 
-function hasEntries(o) {
-  return (o !== null && typeof o === 'object' ? Object.entries(o).length > 0 : false);
-}
+const arrayBufferToBase64 = (arrayBuffer) => Buffer.from(arrayBuffer).toString('base64');
